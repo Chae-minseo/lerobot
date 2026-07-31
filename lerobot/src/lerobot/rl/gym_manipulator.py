@@ -82,6 +82,11 @@ from .joint_observations_processor import JointVelocityProcessorStep, MotorCurre
 
 logging.basicConfig(level=logging.INFO)
 
+ENV_TERMINATED_INFO_KEY = "gym_manipulator.env_terminated"
+ENV_TRUNCATED_INFO_KEY = "gym_manipulator.env_truncated"
+ACTION_DONE_INFO_KEY = "gym_manipulator.action_done"
+ACTION_TRUNCATED_INFO_KEY = "gym_manipulator.action_truncated"
+
 
 @dataclass
 class DatasetConfig:
@@ -319,14 +324,24 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
         # Extract gripper settings with defaults
         use_gripper = cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else True
         gripper_penalty = cfg.processor.gripper.gripper_penalty if cfg.processor.gripper is not None else 0.0
-
-        env = gym.make(
-            f"gym_hil/{cfg.task}",
-            image_obs=True,
-            render_mode="human",
-            use_gripper=use_gripper,
-            gripper_penalty=gripper_penalty,
+        max_episode_steps = (
+            int(cfg.processor.reset.control_time_s * cfg.fps) if cfg.processor.reset is not None else None
         )
+        reset_delay_seconds = (
+            cfg.processor.reset.reset_time_s if cfg.processor.reset is not None else 1.0
+        )
+
+        gym_kwargs = {
+            "image_obs": True,
+            "render_mode": "human",
+            "use_gripper": use_gripper,
+            "gripper_penalty": gripper_penalty,
+            "reset_delay_seconds": reset_delay_seconds,
+        }
+        if max_episode_steps is not None:
+            gym_kwargs["max_episode_steps"] = max_episode_steps
+
+        env = gym.make(f"gym_hil/{cfg.task}", **gym_kwargs)
 
         return env, None
 
@@ -344,12 +359,14 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
         cfg.processor.observation.display_cameras if cfg.processor.observation is not None else False
     )
     reset_pose = cfg.processor.reset.fixed_reset_joint_positions if cfg.processor.reset is not None else None
+    reset_time_s = cfg.processor.reset.reset_time_s if cfg.processor.reset is not None else 5.0
 
     env = RobotEnv(
         robot=robot,
         use_gripper=use_gripper,
         display_cameras=display_cameras,
         reset_pose=reset_pose,
+        reset_time_s=reset_time_s,
     )
 
     return env, teleop_device
@@ -529,6 +546,156 @@ def make_processors(
     )
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, torch.Tensor):
+        return bool(value.detach().cpu().any().item())
+    if isinstance(value, np.ndarray):
+        return bool(value.any())
+    return bool(value)
+
+
+def _info_value(info: dict[str, Any], *keys: Any, default: Any = None) -> Any:
+    for key in keys:
+        if key in info:
+            return info[key]
+        if isinstance(key, TeleopEvents) and key.value in info:
+            return info[key.value]
+    return default
+
+
+def _info_bool(info: dict[str, Any], *keys: Any) -> bool:
+    return _as_bool(_info_value(info, *keys, default=False))
+
+
+def _control_time_s(cfg: GymManipulatorConfig) -> float | None:
+    if cfg.env.processor.reset is None:
+        return None
+    return cfg.env.processor.reset.control_time_s
+
+
+def _env_max_episode_steps(env: gym.Env) -> int | None:
+    current_env = env
+    seen_envs = set()
+    while current_env is not None and id(current_env) not in seen_envs:
+        seen_envs.add(id(current_env))
+        spec = getattr(current_env, "spec", None)
+        max_episode_steps = getattr(spec, "max_episode_steps", None)
+        if max_episode_steps is not None:
+            return int(max_episode_steps)
+        max_episode_steps = getattr(current_env, "_max_episode_steps", None)
+        if max_episode_steps is not None:
+            return int(max_episode_steps)
+        current_env = getattr(current_env, "env", None)
+    return None
+
+
+def _processor_max_episode_steps(
+    env_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
+) -> int | None:
+    for step in getattr(env_processor, "steps", []):
+        max_episode_steps = getattr(step, "max_episode_steps", None)
+        if max_episode_steps is not None:
+            return int(max_episode_steps)
+    return None
+
+
+def _manual_success(info: dict[str, Any]) -> bool:
+    return _info_bool(info, TeleopEvents.SUCCESS, "success", "next.success")
+
+
+def _environment_success(info: dict[str, Any]) -> bool:
+    return _info_bool(info, "succeed", "is_success")
+
+
+def _manual_failure(info: dict[str, Any]) -> bool:
+    next_success = _info_value(info, "next.success")
+    if next_success is not None and not _as_bool(next_success) and not _environment_success(info):
+        return True
+    return _info_bool(info, TeleopEvents.FAILURE, "failure") or (
+        _info_bool(info, TeleopEvents.TERMINATE_EPISODE, "terminate_episode")
+        and not _manual_success(info)
+        and not _info_bool(info, TeleopEvents.RERECORD_EPISODE, "rerecord_episode")
+    )
+
+
+def _reward_success(transition: EnvTransition) -> bool:
+    reward = transition.get(TransitionKey.REWARD, 0.0)
+    if isinstance(reward, torch.Tensor):
+        return bool((reward.detach().cpu() >= 1.0).any().item())
+    if isinstance(reward, np.ndarray):
+        return bool((reward >= 1.0).any())
+    return bool(reward >= 1.0)
+
+
+def classify_episode_end(
+    transition: EnvTransition,
+    episode_step: int,
+    processor_max_episode_steps: int | None,
+) -> str:
+    info = transition.get(TransitionKey.INFO, {})
+    terminated = _as_bool(transition.get(TransitionKey.DONE, False))
+    truncated = _as_bool(transition.get(TransitionKey.TRUNCATED, False))
+    env_terminated = _info_bool(info, ENV_TERMINATED_INFO_KEY)
+    env_truncated = _info_bool(info, ENV_TRUNCATED_INFO_KEY)
+    action_done = _info_bool(info, ACTION_DONE_INFO_KEY)
+
+    if _manual_success(info):
+        return "manual_success"
+    if _manual_failure(info):
+        return "manual_failure"
+    if terminated and _environment_success(info):
+        return "environment_success"
+    if truncated and processor_max_episode_steps is not None and episode_step >= processor_max_episode_steps:
+        return "control_time_elapsed"
+    if truncated and env_truncated:
+        return "time_limit_truncated"
+    if terminated or env_terminated or action_done:
+        return "environment_terminated"
+    if truncated:
+        return "time_limit_truncated"
+    return "unknown"
+
+
+def should_ignore_environment_success(
+    cfg: GymManipulatorConfig,
+    transition: EnvTransition,
+    end_reason: str,
+) -> bool:
+    reset_cfg = cfg.env.processor.reset
+    if cfg.env.name != "gym_hil" or reset_cfg is None or reset_cfg.terminate_on_success:
+        return False
+    return end_reason == "environment_success" and not _manual_success(transition.get(TransitionKey.INFO, {}))
+
+
+def log_episode_end(
+    env: gym.Env,
+    env_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
+    cfg: GymManipulatorConfig,
+    transition: EnvTransition,
+    elapsed_time: float,
+    episode_step: int,
+    end_reason: str,
+) -> None:
+    info = transition.get(TransitionKey.INFO, {})
+    logging.info(
+        "\n[EPISODE END]\n"
+        f"reason={end_reason}\n"
+        f"elapsed_time={elapsed_time:.1f}\n"
+        f"step_count={episode_step}\n"
+        f"terminated={_as_bool(transition.get(TransitionKey.DONE, False))}\n"
+        f"truncated={_as_bool(transition.get(TransitionKey.TRUNCATED, False))}\n"
+        f"success={_manual_success(info) or _environment_success(info) or _reward_success(transition)}\n"
+        f"intervention={_info_bool(info, TeleopEvents.IS_INTERVENTION, 'is_intervention')}\n"
+        f"control_time_s={_control_time_s(cfg)}\n"
+        f"max_episode_steps={_env_max_episode_steps(env)}\n"
+        f"processor_max_episode_steps={_processor_max_episode_steps(env_processor)}\n"
+        f"env_terminated={_info_bool(info, ENV_TERMINATED_INFO_KEY)}\n"
+        f"env_truncated={_info_bool(info, ENV_TRUNCATED_INFO_KEY)}\n"
+        f"action_done={_info_bool(info, ACTION_DONE_INFO_KEY)}\n"
+        f"action_truncated={_info_bool(info, ACTION_TRUNCATED_INFO_KEY)}"
+    )
+
+
 def step_env_and_process_transition(
     env: gym.Env,
     transition: EnvTransition,
@@ -560,9 +727,13 @@ def step_env_and_process_transition(
 
     obs, reward, terminated, truncated, info = env.step(processed_action)
 
+    env_terminated = terminated
+    env_truncated = truncated
+    action_done = processed_action_transition[TransitionKey.DONE]
+    action_truncated = processed_action_transition[TransitionKey.TRUNCATED]
     reward = reward + processed_action_transition[TransitionKey.REWARD]
-    terminated = terminated or processed_action_transition[TransitionKey.DONE]
-    truncated = truncated or processed_action_transition[TransitionKey.TRUNCATED]
+    terminated = terminated or action_done
+    truncated = truncated or action_truncated
     complementary_data = processed_action_transition[TransitionKey.COMPLEMENTARY_DATA].copy()
 
     if hasattr(env, "get_raw_joint_positions"):
@@ -577,6 +748,10 @@ def step_env_and_process_transition(
     for key, value in action_info.items():
         if isinstance(key, TeleopEvents):
             new_info[key] = value
+    new_info[ENV_TERMINATED_INFO_KEY] = env_terminated
+    new_info[ENV_TRUNCATED_INFO_KEY] = env_truncated
+    new_info[ACTION_DONE_INFO_KEY] = action_done
+    new_info[ACTION_TRUNCATED_INFO_KEY] = action_truncated
 
     new_transition = create_transition(
         observation=obs,
@@ -690,6 +865,7 @@ def control_loop(
     episode_idx = 0
     episode_step = 0
     episode_start_time = time.perf_counter()
+    ignored_success_logged = False
 
     try:
         while episode_idx < cfg.dataset.num_episodes_to_record:
@@ -713,6 +889,30 @@ def control_loop(
                 env_processor=env_processor,
                 action_processor=action_processor,
             )
+            processor_max_episode_steps = _processor_max_episode_steps(env_processor)
+            raw_terminated = transition.get(TransitionKey.DONE, False)
+            raw_truncated = transition.get(TransitionKey.TRUNCATED, False)
+            pending_end_reason = classify_episode_end(
+                transition,
+                episode_step=episode_step + 1,
+                processor_max_episode_steps=processor_max_episode_steps,
+            )
+            if should_ignore_environment_success(cfg, transition, pending_end_reason):
+                if not ignored_success_logged:
+                    episode_time = time.perf_counter() - episode_start_time
+                    logging.info(
+                        "\n[EPISODE CONTINUE]\n"
+                        "reason=ignored_environment_success\n"
+                        f"elapsed_time={episode_time:.1f}\n"
+                        f"step_count={episode_step + 1}\n"
+                        f"terminated={_as_bool(raw_terminated)}\n"
+                        f"truncated={_as_bool(raw_truncated)}\n"
+                        f"success={_environment_success(transition.get(TransitionKey.INFO, {}))}\n"
+                        f"control_time_s={_control_time_s(cfg)}\n"
+                        f"max_episode_steps={_env_max_episode_steps(env)}"
+                    )
+                    ignored_success_logged = True
+                transition[TransitionKey.DONE] = False
             terminated = transition.get(TransitionKey.DONE, False)
             truncated = transition.get(TransitionKey.TRUNCATED, False)
 
@@ -743,11 +943,23 @@ def control_loop(
             # Handle episode termination
             if terminated or truncated:
                 episode_time = time.perf_counter() - episode_start_time
-                logging.info(
-                    f"Episode ended after {episode_step} steps in {episode_time:.1f}s with reward {transition[TransitionKey.REWARD]}"
+                end_reason = classify_episode_end(
+                    transition,
+                    episode_step=episode_step,
+                    processor_max_episode_steps=processor_max_episode_steps,
+                )
+                log_episode_end(
+                    env=env,
+                    env_processor=env_processor,
+                    cfg=cfg,
+                    transition=transition,
+                    elapsed_time=episode_time,
+                    episode_step=episode_step,
+                    end_reason=end_reason,
                 )
                 episode_step = 0
                 episode_idx += 1
+                ignored_success_logged = False
 
                 if dataset is not None:
                     if transition[TransitionKey.INFO].get(TeleopEvents.RERECORD_EPISODE, False):
@@ -760,6 +972,7 @@ def control_loop(
 
                 # Reset for new episode
                 transition = reset_and_build_transition(env, env_processor, action_processor)
+                episode_start_time = time.perf_counter()
 
             # Maintain fps timing
             precise_sleep(max(dt - (time.perf_counter() - step_start_time), 0.0))
